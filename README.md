@@ -20,6 +20,48 @@
 - 浓度必须是非负有限数（拒绝负数、`NaN`、`Inf`、空值、非数值）；
 - 列数必须恰好为 2，小时必须是 0..23 的整数。
 
+### 站号变更后的归属登记（源站编号 -> 物理站）
+
+监测网换号后，同一物理站在不同日期可能以不同源站编号发布数据。通过归属登记把
+旧号、新号接到同一物理站下：
+
+`POST /attributions`，JSON：
+
+```json
+{
+  "physical_station_id": "PHYS-001",
+  "source_station_id": "OLD-001",
+  "start_date": "2026-11-01",
+  "end_date": "2026-11-10"
+}
+```
+
+- 日期区间**包含起止日**，`start_date` 不得晚于 `end_date`（否则 400）；
+- **同一源站同一天只能归属一个物理站**：与已有登记（不同物理站）有任意一天重叠即返回
+  `409 attribution_conflict`，并给出重叠区间，登记整体不生效；
+- 并发登记由 SQLite `BEGIN IMMEDIATE` 写事务串行化，校验在事务内完成，只有一份生效；
+  数据库触发器 `trg_attribution_no_source_split` 作为兜底约束；
+- 完全相同的重复登记幂等返回已有记录（HTTP 200，`created=false`）；
+- 同一物理站可以同时登记多个源站（换号交接期旧号、新号并存），查询时按天解析。
+
+`GET /attributions?physical_station_id=&source_station_id=` 列出登记（可按物理站或源站过滤）。
+
+### 按物理站读取逐日数据
+
+`GET /physical-stations/{physical_station_id}/daily-series?start_date=...&end_date=...`
+
+在日期范围内逐天返回：归属解析出的源站编号、当前发布版本、`file_id` 及 24 条读数。
+
+- 某天归属到**唯一**源站且有已发布数据：`status = "ok"`，带 `source_station_id`、
+  `version`、`file_id`、`records`（24 条 `{hour, pm25}`）；
+- 某天有**多个**归属源站同时发布了数据：`status = "source_conflict"`，列出每个候选来源的
+  源站编号、版本与 `file_id`，`records` 为 `null` —— **不会任取其中一份**；
+- 归属存在但当天无已发布数据（或该物理站当天无归属）：`status = "missing"`；
+- 响应含 `day_count`、`conflict_count`、`missing_count` 便于判读；日期区间非法返回 400；
+- **快照一致性**：整个查询在同一个 SQLite 读事务（单一快照）中完成，归属解析与逐日读数
+  来自同一时刻的数据库状态。登记或补报与查询并发时，一次查询看到的归属和读数要么全属于
+  提交前、要么全属于提交后，不会出现"新归属 + 旧数据"的拼接。
+
 ### 版本与补报
 
 - 每个 `(监测点, 日期)` 从版本 1 开始单调递增；
@@ -34,6 +76,9 @@
 | `GET /stations/{station_id}/dates/{data_date}/records` | 当前版本的 24 条小时记录 + 文件标识 `file_id` |
 | `GET /stations/{station_id}/dates/{data_date}/versions` | 全部历史版本（含每版 `file_id`、文件路径、校验和） |
 | `GET /stations/{station_id}/dates/{data_date}/versions/{version}/file` | 下载指定版本留存的原始 CSV（字节一致） |
+| `POST /attributions` | 登记源站编号在日期区间内归属某个物理站 |
+| `GET /attributions` | 列出归属登记（按物理站 / 源站过滤） |
+| `GET /physical-stations/{physical_station_id}/daily-series` | 按物理站 + 日期范围读取逐日已发布数据 |
 | `GET /health` | 健康检查 |
 
 ### 失败安全保证
@@ -51,7 +96,7 @@ app/
   validation.py   # CSV 解析与整批校验（错误行/缺失小时/原因）
   db.py           # SQLite 模式、乐观版本控制、事务与文件原子落盘
   main.py         # FastAPI 路由与错误处理
-tests/            # 35 个 pytest 用例（校验/API/并发/故障恢复）
+tests/            # 50 个 pytest 用例（校验/API/并发/故障恢复/归属与快照）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -91,6 +136,14 @@ curl -X POST http://localhost:8000/stations/ST-001/dates/2026-11-14/uploads \
 
 # 下载历史版本原始 CSV
 curl -OJ http://localhost:8000/stations/ST-001/dates/2026-11-14/versions/1/file
+
+# 登记旧号归属物理站 (2026-11-01 ~ 2026-11-10)
+curl -X POST http://localhost:8000/attributions \
+  -H 'Content-Type: application/json' \
+  -d '{"physical_station_id":"PHYS-001","source_station_id":"ST-OLD","start_date":"2026-11-01","end_date":"2026-11-10"}'
+
+# 按物理站读取拼接后的逐日数据
+curl 'http://localhost:8000/physical-stations/PHYS-001/daily-series?start_date=2026-11-01&end_date=2026-11-12'
 ```
 
 ## 校验失败响应示例

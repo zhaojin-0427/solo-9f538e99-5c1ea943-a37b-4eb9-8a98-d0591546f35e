@@ -6,8 +6,9 @@ from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, Path as PathParam, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Path as PathParam, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 from . import config, db
 from .validation import CsvValidationError, parse_and_validate
@@ -26,8 +27,10 @@ app = FastAPI(
         "按监测点和日期上传/补报每日 24 小时 PM2.5 数据。"
         "整批校验通过才发布；补报携带版本号做乐观并发控制，"
         "成功后整批替换，旧版本原始 CSV 永久留存。"
+        "另提供监测站归属登记（源站编号 -> 物理站）与按物理站、"
+        "日期范围读取已发布逐日数据的查询接口。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -82,6 +85,100 @@ async def _publish_error_handler(_request, exc: db.PublishError) -> JSONResponse
             "message": str(exc),
             "detail": "写入失败，上一版本仍完整可查",
         },
+    )
+
+
+@app.exception_handler(db.AttributionConflictError)
+async def _attribution_conflict_handler(
+    _request, exc: db.AttributionConflictError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": "attribution_conflict",
+            "message": (
+                "同一源站同一天不能归属不同物理站，登记未生效"
+            ),
+            "conflicts": exc.conflicts,
+        },
+    )
+
+
+class AttributionRequest(BaseModel):
+    physical_station_id: str = Field(
+        ..., description="物理站编号（新号/合并后的站）"
+    )
+    source_station_id: str = Field(..., description="源站编号（旧号/新号）")
+    start_date: date = Field(..., description="生效起始日（含）YYYY-MM-DD")
+    end_date: date = Field(..., description="生效结束日（含）YYYY-MM-DD")
+
+
+def _validate_range(start_date: date, end_date: date) -> None:
+    if start_date > end_date:
+        raise HTTPException(
+            status_code=400,
+            detail="start_date 不能晚于 end_date（起止日均包含）",
+        )
+
+
+@app.post("/attributions", status_code=201)
+def create_attribution(payload: AttributionRequest):
+    """登记一个源站编号在日期区间内归属某个物理站。
+
+    同一源站同一天只允许归属一个物理站；重复登记完全相同的区间幂等返回
+    已有记录（``created=false``，HTTP 200）。并发登记由数据库写事务串行化，
+    只有一个能生效，其余返回 409。
+    """
+    physical = _validate_station(payload.physical_station_id)
+    source = _validate_station(payload.source_station_id)
+    _validate_range(payload.start_date, payload.end_date)
+
+    try:
+        row = db.register_attribution(
+            physical, source, payload.start_date, payload.end_date
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    created = row.pop("created")
+    if not created:
+        return JSONResponse(status_code=200, content=row)
+    return row
+
+
+@app.get("/attributions")
+def query_attributions(
+    physical_station_id: str | None = Query(None, description="按物理站过滤"),
+    source_station_id: str | None = Query(None, description="按源站过滤"),
+):
+    """列出归属登记，可按物理站或源站编号过滤。"""
+    if physical_station_id is not None:
+        physical_station_id = _validate_station(physical_station_id)
+    if source_station_id is not None:
+        source_station_id = _validate_station(source_station_id)
+    rows = db.list_attributions(physical_station_id, source_station_id)
+    return {"count": len(rows), "attributions": rows}
+
+
+@app.get("/physical-stations/{physical_station_id}/daily-series")
+def read_physical_station_series(
+    physical_station_id: str = PathParam(..., description="物理站编号"),
+    start_date: date = Query(..., description="起始日（含）YYYY-MM-DD"),
+    end_date: date = Query(..., description="结束日（含）YYYY-MM-DD"),
+):
+    """按物理站读取日期范围内每天的当前已发布数据。
+
+    每天的源站编号由归属登记解析（旧号/新号可跨日期拼接）。查询在单个
+    SQLite 读事务（同一快照）中完成：登记或补报与查询并发时，一次查询
+    看到的归属和读数要么全属于提交前、要么全属于提交后。
+
+    某天有多个归属源站同时发布了数据时，该天标记 ``source_conflict``
+    并列出候选来源，不会任取其中一份。
+    """
+    physical_station_id = _validate_station(physical_station_id)
+    _validate_range(start_date, end_date)
+    return db.get_physical_station_series(
+        physical_station_id, start_date, end_date
     )
 
 
